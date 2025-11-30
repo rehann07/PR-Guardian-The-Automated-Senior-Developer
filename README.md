@@ -1,4 +1,3 @@
-````markdown
 # 🛡️ PR Guardian: The Automated Senior Developer
 
 > **2025 Kaggle AI Agents Capstone Project Submission**
