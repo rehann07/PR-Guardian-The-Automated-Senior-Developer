@@ -1,0 +1,215 @@
+import os
+import time
+import re
+import concurrent.futures
+from groq import Groq, RateLimitError
+
+# --- CONFIGURATION ---
+try:
+    from kaggle_secrets import UserSecretsClient
+    user_secrets = UserSecretsClient()
+    api_key = user_secrets.get_secret("GROQ_API_KEY")
+except ImportError:
+    # Fallback for local/Colab use if kaggle_secrets is not available
+    api_key = os.environ.get("GROQ_API_KEY", "YOUR_GROQ_API_KEY_HERE")
+
+# Initialize Groq Client
+client = Groq(
+    api_key=api_key,
+)
+
+# Using the latest supported Llama 3.3 model
+MODEL_NAME = "llama-3.3-70b-versatile" 
+
+# --- 1. OBSERVABILITY (Key Concept: Observability) ---
+class AgentLogger:
+    """Simple logger to track agent activity and timing."""
+    @staticmethod
+    def log(agent_name: str, message: str):
+        timestamp = time.strftime("%H:%M:%S")
+        print(f"[{timestamp}] 🤖 {agent_name}: {message}")
+
+# --- HELPER: RETRY LOGIC ---
+def chat_with_retry(system_prompt, user_prompt, retries=3, initial_delay=2):
+    """
+    Wraps the Groq API call with exponential backoff to handle rate limits.
+    """
+    delay = initial_delay
+    for attempt in range(retries):
+        try:
+            chat_completion = client.chat.completions.create(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                model=MODEL_NAME,
+                temperature=0.1,
+            )
+            return chat_completion.choices[0].message.content
+        except RateLimitError:
+            if attempt < retries - 1:
+                wait_time = delay * (2 ** attempt)
+                print(f"⚠️ Groq Rate Limit hit. Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                return None
+        except Exception as e:
+            print(f"❌ API Error: {e}")
+            return None
+    return None
+
+# --- 2. TOOLS (Key Concept: Custom Tools) ---
+def scan_for_secrets(code_snippet: str) -> str:
+    """
+    Deterministic Tool: Scans code for common hardcoded secrets.
+    """
+    patterns = {
+        "API Key": r"(?i)(api_?key|secret|token)\s*=\s*['\"][a-zA-Z0-9_\-]{20,}['\"]",
+        "AWS Key": r"AKIA[0-9A-Z]{16}",
+        "Generic Password": r"(?i)(password|passwd|pwd)\s*=\s*['\"][^'\"]{3,}['\"]"
+    }
+    
+    findings = []
+    for label, pattern in patterns.items():
+        if re.search(pattern, code_snippet):
+            findings.append(f"CRITICAL: Found potential {label}")
+            
+    if not findings:
+        return "No hardcoded secrets detected."
+    return "DETECTED:\n" + "\n".join(findings)
+
+# --- 3. AGENT DEFINITIONS (Key Concept: Multi-Agent System) ---
+
+def run_security_agent(code: str) -> str:
+    """Agent A: Focuses purely on security vulnerabilities."""
+    AgentLogger.log("SecurityAgent", "Starting analysis...")
+    
+    # STEP 1: Run the Tool (Explicit usage)
+    tool_output = scan_for_secrets(code)
+    
+    # STEP 2: Feed Tool Output + Code to LLM
+    system_prompt = "You are a Senior Security Engineer. You are strict and concise."
+    user_prompt = f"""
+    Analyze the following Python code for vulnerabilities.
+    
+    Input Code:
+    {code}
+    
+    Tool Scan Results (Already ran):
+    {tool_output}
+    
+    INSTRUCTIONS:
+    1. If the Tool Scan found secrets, REPORT THEM FIRST as Critical Issues.
+    2. Then, look for SQL injection, insecure imports, or unsafe inputs.
+    3. Output your report in bullet points.
+    """
+    
+    result = chat_with_retry(system_prompt, user_prompt)
+    if not result:
+        return "🛡️ Security Agent: Failed (Rate Limit or Error)"
+    return f"🛡️ [SECURITY REPORT]\n{result}"
+
+def run_style_agent(code: str) -> str:
+    """Agent B: Focuses on PEP8, naming conventions, and readability."""
+    AgentLogger.log("StyleAgent", "Starting analysis...")
+    
+    system_prompt = "You are a Python Code Style Enforcer (PEP8). You are helpful but strict."
+    user_prompt = f"""
+    Analyze this code for style issues.
+    1. Check variable naming (snake_case vs CamelCase).
+    2. Check for missing docstrings.
+    3. Identify messy imports.
+    4. Keep it brief.
+    
+    CODE:
+    {code}
+    """
+    
+    result = chat_with_retry(system_prompt, user_prompt)
+    if not result:
+        return "🎨 Style Agent: Failed (Rate Limit or Error)"
+    return f"🎨 [STYLE REPORT]\n{result}"
+
+def run_performance_agent(code: str) -> str:
+    """Agent C: Focuses on Big O, memory leaks, and optimization."""
+    AgentLogger.log("PerfAgent", "Starting analysis...")
+    
+    system_prompt = "You are a Performance Optimization Expert."
+    user_prompt = f"""
+    Analyze this code for performance bottlenecks.
+    1. Identify inefficient loops (e.g., nested loops O(n^2)).
+    2. Suggest faster built-in libraries (e.g., set vs list).
+    3. Explain WHY the change is faster.
+    
+    CODE:
+    {code}
+    """
+    
+    result = chat_with_retry(system_prompt, user_prompt)
+    if not result:
+        return "🚀 Performance Agent: Failed (Rate Limit or Error)"
+    return f"🚀 [PERFORMANCE REPORT]\n{result}"
+
+# --- 4. ORCHESTRATOR (Parallel Execution) ---
+
+def analyze_pr(code_snippet: str):
+    """The Manager that spawns agents in parallel and aggregates results."""
+    print("\n" + "="*50)
+    print("🚦 STARTING PR GUARDIAN (Powered by Llama 3 on Groq)")
+    print("="*50)
+    
+    start_time = time.time()
+    
+    # Run agents in parallel
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        # Groq is very fast, but we still stagger slightly for safety
+        future_sec = executor.submit(run_security_agent, code_snippet)
+        time.sleep(0.5) 
+        future_style = executor.submit(run_style_agent, code_snippet)
+        time.sleep(0.5)
+        future_perf = executor.submit(run_performance_agent, code_snippet)
+        
+        # Gather results
+        sec_result = future_sec.result()
+        style_result = future_style.result()
+        perf_result = future_perf.result()
+        
+    end_time = time.time()
+    duration = round(end_time - start_time, 2)
+    
+    # --- FINAL REPORT ---
+    print("\n" + "="*50)
+    print(f"✅ REVIEW COMPLETE in {duration} seconds")
+    print("="*50)
+    print(sec_result)
+    print("-" * 30)
+    print(style_result)
+    print("-" * 30)
+    print(perf_result)
+    print("="*50)
+
+# --- 5. EXECUTION & EVALUATION ---
+
+if __name__ == "__main__":
+    # Test Case: A snippet with bad style, security risks, and poor performance
+    BAD_CODE_SUBMISSION = """
+import time, os
+
+def Process_Data(data):
+    # API Key for database
+    api_key = "sk-123499355bcdef1234567890abcdef" 
+    
+    results = []
+    # Inefficient loop (O(n^2))
+    for i in data:
+        for j in data:
+            if i == j:
+                results.append(i)
+                
+    return results
+    """
+
+    if api_key == "YOUR_GROQ_API_KEY_HERE" or not api_key:
+        print("❌ ERROR: Please set your GROQ_API_KEY in Kaggle Secrets or environment variables!")
+    else:
+        analyze_pr(BAD_CODE_SUBMISSION)
